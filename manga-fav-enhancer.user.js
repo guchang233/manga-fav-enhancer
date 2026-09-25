@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页资源库 / 漫画收藏助手 (Web Resource Harvester)
 // @namespace    https://github.com/local/manga-fav-enhancer
-// @version      6.1.0
+// @version      6.2.0
 // @description  两种模式的独立弹窗工具：🌐 全局模式——精准识别网页中所有资源并按「角色」细分（主图/卡片配图/缩略图/头像/Logo/背景图/画廊/视频封面/装饰图/视频/音频/文档/压缩包/字体），带体积探测、预览与单个或批量下载；📚 漫画模式——为漫画站收藏提供标签分类、搜索、封面网格、批量打标（内置 18comic 系精确预设）；🎬 视频下载——B站 playurl API 解析（fnval=4048 各清晰度/音视频分离）+ Referer 中继下载（修复 CDN 403）、抖音官方接口无水印解析。
 // @author       you
 // @match        *://*/*
@@ -567,6 +567,7 @@
         if (u) items.push({
           url: u, label: (d.durl.length > 1 ? '分段' + (i + 1) + ' · ' : '') + '完整文件',
           kind: 'video', group: 'file', size: seg.size || 0,
+          referer: 'https://www.bilibili.com/',
         });
       });
     }
@@ -584,6 +585,7 @@
           kind: 'video', group: 'video', bandwidth: v.bandwidth || 0,
           size: dur && v.bandwidth ? Math.round(v.bandwidth * dur / 1000 / 8) : 0,
           qualityId: v.id, codecRank,
+          referer: 'https://www.bilibili.com/',
         };
         if (!byQ[v.id] || rec.codecRank > byQ[v.id].codecRank) byQ[v.id] = rec;
       });
@@ -598,6 +600,7 @@
           label: '音频流 ' + (BILI_AQUALITY[a.id] || (a.bandwidth ? Math.round(a.bandwidth / 1000) + 'kbps' : '')),
           kind: 'audio', group: 'audio', bandwidth: a.bandwidth || 0,
           size: dur && a.bandwidth ? Math.round(a.bandwidth * dur / 1000 / 8) : 0,
+          referer: 'https://www.bilibili.com/',
         };
       });
       Object.keys(byA).forEach(k => items.push(byA[k]));
@@ -681,7 +684,7 @@
     const addPlay = (u, label, wm) => {
       if (!u || seen.has(u)) return;
       seen.add(u);
-      out.items.push({ url: u, label: label + (wm ? '（含水印）' : '（无水印）'), kind: 'video', group: wm ? 'video' : 'nowm', direct: true, wm: !!wm });
+      out.items.push({ url: u, label: label + (wm ? '（含水印）' : '（无水印）'), kind: 'video', group: wm ? 'video' : 'nowm', direct: true, wm: !!wm, referer: 'https://www.douyin.com/' });
     };
 
     // 递归挖 SSR 数据里的视频地址
@@ -746,24 +749,33 @@
     }
     else if (/(^|\.)douyin\.com$/i.test(host)) platform = parseDouyin(W);
 
+    // hook 兜底：当前站点页面里拦到的媒体地址一律标当前站点 Referer
+    // （B站 CDN 域名会轮换到随机第三方域名如 *.edge.*.cn，按域名匹配必漏）
+    const siteReferer = /(^|\.)bilibili\.com$/i.test(host) ? 'https://www.bilibili.com/'
+      : /(^|\.)douyin\.com$/i.test(host) ? 'https://www.douyin.com/' : '';
     const hooks = (W.__MFE_NET__ && Array.isArray(W.__MFE_NET__.items))
-      ? W.__MFE_NET__.items.slice(-200).map(x => ({ ...x }))
+      ? W.__MFE_NET__.items.slice(-200).map(x => ({ ...x, referer: siteReferer || cdnReferer(x.url) }))
       : [];
 
     // hook 兜底里也做抖音去水印变体
     const extra = [];
     for (const h of hooks) {
       if (/playwm/i.test(h.url)) {
-        extra.push({ url: h.url.replace(/playwm/i, 'play'), api: h.api, t: h.t });
+        extra.push({ url: h.url.replace(/playwm/i, 'play'), api: h.api, t: h.t, referer: h.referer });
       }
     }
     return { platform, hooks: hooks.concat(extra), pageUrl: location.href };
   }
 
-  /** 视频类 CDN 的防盗链 Referer（B站/抖音 CDN 校验 Referer，缺了必 403） */
+  /**
+   * CDN 防盗链 Referer 兜底判断。注意：B站 CDN 域名会轮换（bilivideo.com /
+   * akamaized / 随机第三方 mcdn 域名），此匹配只作兜底——主逻辑是解析时把
+   * 来源站点 Referer 直接写进条目（item.referer）。
+   */
   function cdnReferer(url) {
-    if (/bilivideo\.com|akamaized\.net|szbdyd\.com/i.test(url)) return 'https://www.bilibili.com/';
-    if (/douyinvod\.com|douyin\.com|snssdk\.com|zjcdn\.com|bytecdn/i.test(url)) return 'https://www.douyin.com/';
+    if (/bilivideo\.com|akamaized\.net|szbdyd\.com|hdslb\.com|upos|mountaintoys|douyin|douyinvod|snssdk|zjcdn|bytecdn/i.test(url)) {
+      return /douyin|douyinvod|snssdk|zjcdn|bytecdn/i.test(url) ? 'https://www.douyin.com/' : 'https://www.bilibili.com/';
+    }
     return '';
   }
 
@@ -811,9 +823,13 @@
     const viaGMXL = () => new Promise((resolve) => {
       if (typeof GM_xmlhttpRequest !== 'function') return resolve(false);
       try {
+        // 实测（2026-09）：B站 CDN 要求 Referer 与 User-Agent 同时匹配，缺一即 403
+        const ref = referer || cdnReferer(url);
+        const headers = { 'User-Agent': navigator.userAgent };
+        if (ref) headers.Referer = ref;
         GM_xmlhttpRequest({
           method: 'GET', url, responseType: 'blob', timeout: 600000,
-          headers: (referer || cdnReferer(url)) ? { Referer: referer || cdnReferer(url) } : {},
+          headers,
           onprogress: (p) => prog(p.loaded, p.total || 0),
           onload: (r) => {
             if (r.status >= 400 || !r.response) return resolve(false);
@@ -1600,16 +1616,16 @@
     return '';
   }
 
-  function dlVideoItem(url, name) {
+  function dlVideoItem(url, name, ref) {
     if (!alive()) { vstatus('原页面已关闭，无法下载', true); return Promise.resolve(); }
-    vstatus('⬇ 下载中：' + name + '（带 Referer 中继，大文件请等待，勿关原页面）');
+    vstatus('⬇ 下载中：' + name + '（带 Referer+UA 中继，大文件请等待，勿关原页面）');
     var timer = setInterval(function () {
       var p = M.getProgress && M.getProgress();
       if (p && p.url === url && p.loaded) {
         vstatus('⬇ ' + name + '：' + (p.total ? Math.round(p.loaded / p.total * 100) + '% · ' : '') + bytes(p.loaded));
       }
     }, 400);
-    return M.downloadResource(url, name, refFor(url)).then(function (ok) {
+    return M.downloadResource(url, name, ref || refFor(url)).then(function (ok) {
       clearInterval(timer);
       vstatus(ok ? '✅ 已保存：' + name : '❌ 保存失败：可复制链接用 IDM / ffmpeg 下载', !ok);
     });
@@ -1683,7 +1699,7 @@
           else if (it.wm) badge = '<span class="badge2 wm">含水印</span>';
           else if (it.group === 'video' && pf.platform === '哔哩哔哩') badge = '<span class="badge2 hd">' + esc((it.label.split(' ')[0]) || '') + '</span>';
           else if (it.stream) badge = '<span class="badge2 wm">流</span>';
-          html += '<div class="vitem" data-url="' + esc(it.url) + '">'
+          html += '<div class="vitem" data-url="' + esc(it.url) + '" data-ref="' + esc(it.referer || '') + '">'
             + '<span class="lb">' + esc(it.label) + '</span>' + badge
             + '<span class="sub">' + esc(it.url.slice(0, 90)) + sizeStr + '</span>'
             + (it.stream ? '' : '<button class="btn primary vdl">⬇</button>')
@@ -1706,7 +1722,7 @@
         seen[hk.url] = 1;
         shown++;
         var isM3u8 = /m3u8/i.test(hk.url);
-        html += '<div class="vitem" data-url="' + esc(hk.url) + '">'
+        html += '<div class="vitem" data-url="' + esc(hk.url) + '" data-ref="' + esc(hk.referer || '') + '">'
           + '<span class="lb">' + (isM3u8 ? 'HLS 列表' : '媒体地址') + '</span>'
           + '<span class="sub">' + esc(hk.url.slice(0, 110)) + (hk.api ? ' ← ' + esc(String(hk.api).slice(0, 60)) : '') + '</span>'
           + '<button class="btn primary vdl">⬇</button>'
@@ -1735,9 +1751,9 @@
         var bestV = vids.reduce(function (a, b) { return (b.qualityId || 0) > (a.qualityId || 0) ? b : a; });
         var bestA = auds.length ? auds.reduce(function (a, b) { return (b.bandwidth || 0) > (a.bandwidth || 0) ? b : a; }) : null;
         var base = safeName(pf.title || 'bilibili') + '_' + (bestV.label.split(' ')[0] || 'video');
-        dlVideoItem(bestV.url, base + '_video' + vidExt(bestV.url)).then(function () {
+        dlVideoItem(bestV.url, base + '_video' + vidExt(bestV.url), bestV.referer).then(function () {
           if (bestA) setTimeout(function () {
-            dlVideoItem(bestA.url, base + '_audio' + vidExt(bestA.url));
+            dlVideoItem(bestA.url, base + '_audio' + vidExt(bestA.url), bestA.referer);
           }, 500);
         });
         return;
@@ -1754,6 +1770,7 @@
       var item = ev.target.closest && ev.target.closest('.vitem');
       if (!item || !item.getAttribute('data-url')) return;
       var url = item.getAttribute('data-url');
+      var ref = item.getAttribute('data-ref') || '';
       var cls = ev.target.classList;
       if (cls && cls.contains('vdl')) {
         var name = safeName((pf && pf.title) || 'video');
@@ -1761,7 +1778,7 @@
           var lb = (item.querySelector('.lb') || {}).textContent || 'video';
           name += '_' + lb.split(' ')[0] + vidExt(url);
         } else name += vidExt(url);
-        dlVideoItem(url, name);
+        dlVideoItem(url, name, ref);
       } else if (cls && cls.contains('vcp')) {
         copyTextV(url, '已复制 URL');
       } else if (cls && cls.contains('vop')) {

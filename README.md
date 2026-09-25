@@ -82,7 +82,7 @@
 - **playurl API 解析**（v6.1 重写）：与播放器同域调用 `api.bilibili.com/x/player/playurl`（`fnval=4048`，带登录 cookie，旧端点免 wbi 签名），拿到**全部已授权清晰度**的视频流（360P～8K，每个清晰度保留兼容性最好的编码 avc > hevc > av01）与音频流（64k/132k/320k/杜比/Hi-Res），按 `带宽 × 时长` 估算体积；
 - cid 缺失时自动用 `x/web-interface/view` 补齐；API 不可用时回退页面内嵌 `__playinfo__`，再不行靠网络拦截兜底（解析来源会显示在状态栏）；
 - 顶部给出**推荐组合**（最高清晰度视频 + 最高音质音频），一键「⬇ 下载视频+音频」；
-- **带 Referer 的中继下载**（v6.1 修复 403）：B站 CDN（`*.bilivideo.com`）强校验 `Referer: https://www.bilibili.com/`，`GM_download` 带不了这个头必 403。现在自动走 `GM_xmlhttpRequest` 带 Referer 拉流 → blob 中继保存，弹窗实时显示进度百分比；
+- **带 Referer + UA 的中继下载**（v6.2 修复 403/0 秒问题）：实测 B站 CDN 要求 `Referer` 与 `User-Agent` **同时匹配，缺一即 403**（返回空体/错误页，表现即"0 秒视频"）。下载自动走 `GM_xmlhttpRequest` 带完整请求头拉流 → blob 中继保存，弹窗实时显示进度；Referer 按**解析来源站点**打标（B站页面解析出的所有地址一律带 `https://www.bilibili.com/`），不再依赖 CDN 域名匹配——因为 B站 CDN 域名会轮换（bilivideo.com ↔ akamaized ↔ 随机第三方 mcdn 域名），按域名猜必漏。已实测 4 种不同 CDN 节点（含第三方域名）全部下载成功；
 - 「📋 ffmpeg 合并命令」：DASH 音视频分离，两个文件下完本地合并：
   ```
   ffmpeg -headers "Referer: https://www.bilibili.com/" -i "视频.m4s" -headers "Referer: https://www.bilibili.com/" -i "音频.m4a" -c copy "标题.mp4"
