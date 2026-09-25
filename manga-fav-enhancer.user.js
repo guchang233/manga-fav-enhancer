@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页资源库 / 漫画收藏助手 (Web Resource Harvester)
 // @namespace    https://github.com/local/manga-fav-enhancer
-// @version      6.0.0
-// @description  两种模式的独立弹窗工具：🌐 全局模式——精准识别网页中所有资源并按「角色」细分（主图/卡片配图/缩略图/头像/Logo/背景图/画廊/视频封面/装饰图/视频/音频/文档/压缩包/字体），带体积探测、预览与单个或批量下载；📚 漫画模式——为漫画站收藏提供标签分类、搜索、封面网格、批量打标（内置 18comic 系精确预设）。
+// @version      6.1.0
+// @description  两种模式的独立弹窗工具：🌐 全局模式——精准识别网页中所有资源并按「角色」细分（主图/卡片配图/缩略图/头像/Logo/背景图/画廊/视频封面/装饰图/视频/音频/文档/压缩包/字体），带体积探测、预览与单个或批量下载；📚 漫画模式——为漫画站收藏提供标签分类、搜索、封面网格、批量打标（内置 18comic 系精确预设）；🎬 视频下载——B站 playurl API 解析（fnval=4048 各清晰度/音视频分离）+ Referer 中继下载（修复 CDN 403）、抖音官方接口无水印解析。
 // @author       you
 // @match        *://*/*
 // @run-at       document-start
@@ -22,6 +22,39 @@
    * ================================================================== */
 
   const HOOK_MEDIA_RE = /https?:\/\/[^\s"'<>\\]+?\.(?:mp4|m3u8|flv|ts|m4s|mpd|webm|mov|mkv)(?:\?[^\s"'<>\\]*)?|https?:\/\/[^\s"'<>\\]*(?:douyinvod\.com|aweme\/v1\/play|bilivideo\.com|douyin\.com\/aweme)[^\s"'<>\\]*/gi;
+
+  /**
+   * 抖音 detail/feed 接口结构化提取（参考抖音解析类仓库的通用做法）：
+   * 页面自己会带完整签名请求 aweme/v1/web/aweme/detail，我们只拦截响应 JSON，
+   * 从官方 play_addr 拿无水印地址（uri → aweme/v1/play 构造），比正则扫 URL 可靠。
+   */
+  function douyinApiExtract(apiUrl, text, net) {
+    try {
+      if (!/aweme\/v1\//.test(apiUrl) || !/detail|feed/i.test(apiUrl)) return;
+      const j = JSON.parse(text);
+      const arr = [];
+      if (j && j.aweme_detail) arr.push(j.aweme_detail);
+      if (j && Array.isArray(j.aweme_list)) arr.push(...j.aweme_list);
+      if (j && j.data && j.data.aweme_info) arr.push(j.data.aweme_info);
+      if (j && Array.isArray(j.data)) j.data.forEach(x => { if (x && x.aweme_info) arr.push(x.aweme_info); });
+      net.douyin = net.douyin || [];
+      for (const a of arr) {
+        const v = a && a.video;
+        if (!v) continue;
+        const pa = v.play_addr, da = v.download_addr;
+        const rec = { title: String((a && a.desc) || '').slice(0, 80), nowm: '', wm: '', t: Date.now() };
+        const fallbackUri = (pa && pa.uri) ? 'https://www.douyin.com/aweme/v1/play/?video_id=' + pa.uri + '&ratio=1080p&line=0' : '';
+        if (pa && Array.isArray(pa.url_list) && pa.url_list.length) {
+          rec.nowm = pa.url_list.find(u => !/playwm/i.test(u)) || fallbackUri;
+        } else rec.nowm = fallbackUri;
+        if (da && Array.isArray(da.url_list)) rec.wm = da.url_list[0] || '';
+        if ((rec.nowm || rec.wm) && !net.douyin.some(x => x.nowm === rec.nowm && x.wm === rec.wm)) {
+          net.douyin.push(rec);
+          if (net.douyin.length > 50) net.douyin.shift();
+        }
+      }
+    } catch (e) { /* 非 JSON 或非目标接口，静默 */ }
+  }
 
   function installNetHooks() {
     const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
@@ -49,6 +82,7 @@
         HOOK_MEDIA_RE.lastIndex = 0;
         while ((m = HOOK_MEDIA_RE.exec(text))) urls.push(m[0].replace(/\\u002f/gi, '/').replace(/\\\//g, '/'));
         if (urls.length) push(apiUrl, urls);
+        douyinApiExtract(apiUrl, text, net);
       } catch (e) { /* noop */ }
     };
 
@@ -520,60 +554,114 @@
    * ================================================================== */
 
   const BILI_QUALITY = { 16: '360P', 32: '480P', 64: '720P', 74: '720P60', 80: '1080P', 112: '1080P+', 116: '1080P60', 120: '4K', 125: 'HDR', 126: '杜比视界', 127: '8K' };
-  const BILI_AQUALITY = { 30216: '64kbps', 30232: '132kbps', 30280: '192kbps', 30250: '杜比全景声', 30251: 'Hi-Res' };
+  const BILI_AQUALITY = { 30216: '64kbps', 30232: '132kbps', 30280: '320kbps', 30250: '杜比全景声', 30251: 'Hi-Res' };
   const BILI_CODEC = { 7: 'H.264', 12: 'H.265', 13: 'AV1' };
 
-  function parseBilibili(W) {
-    const out = { platform: '哔哩哔哩', title: '', bvid: '', items: [] };
+  /** playurl 数据（DASH/durl）→ 条目数组；每个清晰度只保留兼容性最好的编码（avc > hevc > av01） */
+  function biliDataToItems(d) {
+    const items = [];
+    if (!d) return items;
+    if (Array.isArray(d.durl) && d.durl.length) {
+      d.durl.forEach((seg, i) => {
+        const u = seg.url || (seg.backupUrl && seg.backupUrl[0]);
+        if (u) items.push({
+          url: u, label: (d.durl.length > 1 ? '分段' + (i + 1) + ' · ' : '') + '完整文件',
+          kind: 'video', group: 'file', size: seg.size || 0,
+        });
+      });
+    }
+    if (d.dash) {
+      const dur = d.timelength || 0; // ms
+      const byQ = {};
+      (d.dash.video || []).forEach(v => {
+        const u = v.baseUrl || (v.backupUrl && v.backupUrl[0]);
+        if (!u) return;
+        const codecs = String(v.codecs || '');
+        const codecRank = /avc1/i.test(codecs) ? 3 : /hev1|hvc1/i.test(codecs) ? 2 : /av01/i.test(codecs) ? 1 : 0;
+        const rec = {
+          url: u,
+          label: (BILI_QUALITY[v.id] || v.id + 'P') + ' 视频流' + (BILI_CODEC[v.codecid] ? ' ' + BILI_CODEC[v.codecid] : ''),
+          kind: 'video', group: 'video', bandwidth: v.bandwidth || 0,
+          size: dur && v.bandwidth ? Math.round(v.bandwidth * dur / 1000 / 8) : 0,
+          qualityId: v.id, codecRank,
+        };
+        if (!byQ[v.id] || rec.codecRank > byQ[v.id].codecRank) byQ[v.id] = rec;
+      });
+      Object.keys(byQ).forEach(k => items.push(byQ[k]));
+      const audios = [...(d.dash.audio || []), ...((d.dash.dolby && d.dash.dolby.audio) || []), ...((d.dash.flac && d.dash.flac.audio) || [])];
+      const byA = {};
+      audios.forEach(a => {
+        const u = a.baseUrl || (a.backupUrl && a.backupUrl[0]);
+        if (!u || byA[a.id]) return;
+        byA[a.id] = {
+          url: u,
+          label: '音频流 ' + (BILI_AQUALITY[a.id] || (a.bandwidth ? Math.round(a.bandwidth / 1000) + 'kbps' : '')),
+          kind: 'audio', group: 'audio', bandwidth: a.bandwidth || 0,
+          size: dur && a.bandwidth ? Math.round(a.bandwidth * dur / 1000 / 8) : 0,
+        };
+      });
+      Object.keys(byA).forEach(k => items.push(byA[k]));
+    }
+    return items;
+  }
+
+  /**
+   * B站解析（参考 bilibili-API-collect + Bilibili-Evolved 下载模块）：
+   * ① cid 缺失时用 view API 补；② playurl API（fnval=4048，与播放器同域带 cookie，旧端点免 wbi）；
+   * ③ __playinfo__ 兜底（可能只有当前清晰度）。CDN 有 Referer 防盗链，下载走中继（见 downloadResource）。
+   */
+  async function parseBilibili(W) {
+    const out = { platform: '哔哩哔哩', title: '', bvid: '', cid: '', items: [], source: '' };
     try {
       const st = W.__INITIAL_STATE__;
       if (st && st.videoData) {
         out.title = (st.videoData.title || '').trim();
         out.bvid = st.videoData.bvid || '';
+        out.cid = st.videoData.cid || '';
       }
     } catch (e) { /* noop */ }
+    if (!out.bvid) {
+      const m = location.pathname.match(/\/video\/(BV[0-9A-Za-z]+)/);
+      if (m) out.bvid = m[1];
+    }
     if (!out.title) out.title = document.title.replace(/_哔哩哔哩.*$/, '').trim();
 
-    const parsePi = (pi) => {
-      const d = pi && pi.data;
-      if (!d) return;
-      // durl：完整文件（MP4/FLV）
-      if (Array.isArray(d.durl) && d.durl.length) {
-        d.durl.forEach((seg, i) => {
-          const u = seg.url || (seg.backupUrl && seg.backupUrl[0]);
-          if (u) out.items.push({
-            url: u, label: (d.durl.length > 1 ? '分段' + (i + 1) + ' · ' : '') + '完整文件',
-            kind: 'video', group: 'file', size: seg.size || 0, direct: true,
-          });
-        });
-      }
-      // dash：视频流 + 音频流分离
-      if (d.dash) {
-        const dur = d.timelength || 0; // ms
-        (d.dash.video || []).forEach(v => {
-          const u = v.baseUrl || (v.backupUrl && v.backupUrl[0]);
-          if (u) out.items.push({
-            url: u,
-            label: (BILI_QUALITY[v.id] || v.id + 'P') + ' 视频流' + (BILI_CODEC[v.codecid] ? ' ' + BILI_CODEC[v.codecid] : ''),
-            kind: 'video', group: 'video', bandwidth: v.bandwidth || 0,
-            size: dur && v.bandwidth ? Math.round(v.bandwidth * dur / 1000 / 8) : 0,
-            qualityId: v.id,
-          });
-        });
-        const audios = [...(d.dash.audio || []), ...((d.dash.dolby && d.dash.dolby.audio) || []), ...((d.dash.flac && d.dash.flac.audio) || [])];
-        audios.forEach(a => {
-          const u = a.baseUrl || (a.backupUrl && a.backupUrl[0]);
-          if (u) out.items.push({
-            url: u,
-            label: '音频流 ' + (BILI_AQUALITY[a.id] || (a.bandwidth ? Math.round(a.bandwidth / 1000) + 'kbps' : '')),
-            kind: 'audio', group: 'audio', bandwidth: a.bandwidth || 0,
-            size: dur && a.bandwidth ? Math.round(a.bandwidth * dur / 1000 / 8) : 0,
-          });
-        });
-      }
+    const apiGet = async (u) => {
+      const r = await fetch(u, { credentials: 'include' });
+      if (!r.ok) return null;
+      return r.json();
     };
 
-    try { parsePi(W.__playinfo__); } catch (e) { /* noop */ }
+    if (!out.cid && out.bvid) {
+      try {
+        const j = await apiGet('https://api.bilibili.com/x/web-interface/view?bvid=' + encodeURIComponent(out.bvid));
+        if (j && j.code === 0 && j.data) {
+          out.cid = j.data.cid || '';
+          if (!out.title) out.title = (j.data.title || '').trim();
+        }
+      } catch (e) { /* noop */ }
+    }
+
+    if (out.bvid && out.cid) {
+      try {
+        const j = await apiGet('https://api.bilibili.com/x/player/playurl?bvid=' + encodeURIComponent(out.bvid)
+          + '&cid=' + encodeURIComponent(out.cid) + '&fnver=0&fnval=4048&fourk=1&qn=120');
+        if (j && j.code === 0 && j.data) {
+          out.items = biliDataToItems(j.data);
+          if (out.items.length) out.source = 'playurl API（fnval=4048）';
+        }
+      } catch (e) { /* noop */ }
+    }
+
+    // 兜底：页面内嵌 __playinfo__（无 .data 包装，直接含 dash/durl），与 API 结果按 URL 去重合并
+    try {
+      const pi = (W.__playinfo__ && W.__playinfo__.dash) ? W.__playinfo__ : (W.__playinfo__ && W.__playinfo__.data ? W.__playinfo__.data : null);
+      if (pi) {
+        if (!out.source) out.source = '__playinfo__（兜底）';
+        const have = new Set(out.items.map(x => x.url));
+        biliDataToItems(pi).forEach(x => { if (!have.has(x.url)) out.items.push(x); });
+      }
+    } catch (e) { /* noop */ }
 
     // 正在播放的 MSE 流（标记，不给下载）
     try {
@@ -626,6 +714,16 @@
       } catch (e) { /* noop */ }
     }
 
+    // 网络钩子结构化提取（document-start 拦到的 detail/feed 官方 JSON，最可靠）
+    try {
+      const dl = (W.__MFE_NET__ && W.__MFE_NET__.douyin) || [];
+      dl.forEach(rec => {
+        if (rec.nowm) addPlay(rec.nowm, '视频', false);
+        if (rec.wm) addPlay(rec.wm, '视频', true);
+        if (rec.title && !out.title) out.title = rec.title;
+      });
+    } catch (e) { /* noop */ }
+
     // 标题
     try {
       const t = document.querySelector('h1, [data-e2e="video-desc"], .video-info-detail, [data-e2e="video-title"]');
@@ -637,12 +735,15 @@
     return out;
   }
 
-  /** 平台扫描入口（弹窗调用）：识别当前站点并返回解析结果 + 网络拦截兜底 */
-  function platformScan() {
+  /** 平台扫描入口（弹窗调用，async）：识别当前站点并返回解析结果 + 网络拦截兜底 */
+  async function platformScan() {
     const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
     const host = siteKey();
     let platform = null;
-    if (/(^|\.)bilibili\.com$/i.test(host)) platform = parseBilibili(W);
+    if (/(^|\.)bilibili\.com$/i.test(host)) {
+      try { platform = await parseBilibili(W); }
+      catch (e) { platform = { platform: '哔哩哔哩', title: '', bvid: '', cid: '', items: [], source: '', error: String((e && e.message) || e) }; }
+    }
     else if (/(^|\.)douyin\.com$/i.test(host)) platform = parseDouyin(W);
 
     const hooks = (W.__MFE_NET__ && Array.isArray(W.__MFE_NET__.items))
@@ -659,9 +760,11 @@
     return { platform, hooks: hooks.concat(extra), pageUrl: location.href };
   }
 
-  /** 下载平台视频（GM_download；B站 dash 需要 Referer，GM_download 自带页面 origin） */
-  function downloadPlatformVideo(url, filename) {
-    return downloadResource(url, filename);
+  /** 视频类 CDN 的防盗链 Referer（B站/抖音 CDN 校验 Referer，缺了必 403） */
+  function cdnReferer(url) {
+    if (/bilivideo\.com|akamaized\.net|szbdyd\.com/i.test(url)) return 'https://www.bilibili.com/';
+    if (/douyinvod\.com|douyin\.com|snssdk\.com|zjcdn\.com|bytecdn/i.test(url)) return 'https://www.douyin.com/';
+    return '';
   }
 
   /** HEAD 探测体积与真实 MIME */
@@ -687,38 +790,75 @@
     });
   }
 
-  /** 下载资源（GM_download 跨域，失败回退新标签） */
-  function downloadResource(url, filename) {
-    return new Promise((resolve) => {
-      const fallback = () => {
-        try {
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = filename || '';
-          a.target = '_blank';
-          a.rel = 'noopener';
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-        } catch { /* noop */ }
-        resolve(false);
-      };
+  /**
+   * 下载资源。三级策略（参考 Bilibili-Evolved 下载模块 + bilibili-API-collect 文档）：
+   * ① 需 Referer 的视频 CDN（B站/抖音）：GM_download 带不了 Referer 必 403 →
+   *    GM_xmlhttpRequest 带 Referer 拉 blob → objectURL 中继保存（实时进度写入 __MFE_DL__）；
+   * ② GM_download（普通跨域资源，浏览器原生下载不占内存）；
+   * ③ <a download> 兜底。
+   */
+  function downloadResource(url, filename, referer) {
+    const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    const prog = (loaded, total) => { try { W.__MFE_DL__ = { url, loaded: loaded || 0, total: total || 0 }; } catch (e) { /* noop */ } };
+    const saveBlob = (blob) => {
+      const bu = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = bu; a.download = filename || 'mfe-download';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => { try { URL.revokeObjectURL(bu); } catch (e) { /* noop */ } }, 120000);
+      return true;
+    };
+    const viaGMXL = () => new Promise((resolve) => {
+      if (typeof GM_xmlhttpRequest !== 'function') return resolve(false);
       try {
-        if (typeof GM_download === 'function') {
-          GM_download({ url, name: filename || 'mfe-download', onsave: () => resolve(true), onerror: fallback, ontimeout: fallback });
-        } else fallback();
-      } catch { fallback(); }
+        GM_xmlhttpRequest({
+          method: 'GET', url, responseType: 'blob', timeout: 600000,
+          headers: (referer || cdnReferer(url)) ? { Referer: referer || cdnReferer(url) } : {},
+          onprogress: (p) => prog(p.loaded, p.total || 0),
+          onload: (r) => {
+            if (r.status >= 400 || !r.response) return resolve(false);
+            try { resolve(saveBlob(r.response)); } catch (e) { resolve(false); }
+          },
+          onerror: () => resolve(false),
+          ontimeout: () => resolve(false),
+        });
+      } catch (e) { resolve(false); }
+    });
+    const viaGMDownload = () => new Promise((resolve) => {
+      try {
+        if (typeof GM_download !== 'function') return resolve(false);
+        GM_download({ url, name: filename || 'mfe-download', onsave: () => resolve(true), onerror: () => resolve(false), ontimeout: () => resolve(false) });
+      } catch (e) { resolve(false); }
+    });
+    const viaAnchor = () => {
+      try {
+        const a = document.createElement('a');
+        a.href = url; a.download = filename || ''; a.target = '_blank'; a.rel = 'noopener';
+        document.body.appendChild(a); a.click(); a.remove();
+      } catch (e) { /* noop */ }
+      return false;
+    };
+    return new Promise(async (resolve) => {
+      const needRef = !!(referer || cdnReferer(url));
+      let ok = false;
+      if (needRef) ok = await viaGMXL();
+      if (!ok) ok = await viaGMDownload();
+      if (!ok) ok = await viaGMXL();
+      if (!ok) ok = viaAnchor();
+      prog(0, 0);
+      resolve(!!ok);
     });
   }
 
   // 弹窗同源调用的 API（扫描/下载/探测必须在原页面上下文执行）
   const PAGE = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+  const getProgress = () => PAGE.__MFE_DL__ || null;
   PAGE.__MFE__ = {
     siteKey, getPreset, getCfg,
     loadEntries, saveEntries, store,
     scanPage, crawlNextPage, testPage,
     collectResources, downloadResource, probeSize,
-    platformScan,
+    platformScan, cdnReferer, getProgress,
   };
 
   /* ==================================================================
@@ -1431,13 +1571,15 @@
 
   function doVidScan() {
     if (!alive()) { vstatus('原页面已关闭，请回到原页面重新打开', true); return; }
-    try {
-      vidData = M.platformScan();
+    vstatus('解析中…（B站会实时调用播放接口，约 1-2 秒）');
+    Promise.resolve().then(function () { return M.platformScan(); }).then(function (data) {
+      vidData = data;
       renderVid();
       var pf = vidData.platform;
-      if (pf) vstatus('已解析' + pf.platform + (pf.title ? '：' + pf.title : '') + '，共 ' + pf.items.length + ' 条' + (vidData.hooks.length ? '（另拦截到 ' + vidData.hooks.length + ' 个网络媒体地址）' : ''));
+      if (pf && pf.error) vstatus('解析出错：' + pf.error + '；已用网络拦截兜底', true);
+      else if (pf) vstatus('已解析' + pf.platform + (pf.source ? '（来源：' + pf.source + '）' : '') + (pf.title ? '：' + pf.title : '') + '，共 ' + pf.items.length + ' 条' + (vidData.hooks.length ? '（另拦截到 ' + vidData.hooks.length + ' 个网络媒体地址）' : ''));
       else vstatus('当前站点没有专属解析器；已拦截到 ' + vidData.hooks.length + ' 个网络媒体地址（通用兜底）');
-    } catch (e) { vstatus('解析失败：' + e.message, true); }
+    }).catch(function (e) { vstatus('解析失败：' + ((e && e.message) || e), true); });
   }
 
   function safeName(s) {
@@ -1452,14 +1594,26 @@
     return kind === 'audio' ? '.m4a' : '.mp4';
   }
 
-  function dlVideoItem(url, name) {
-    if (!alive()) { vstatus('原页面已关闭，无法下载', true); return Promise.resolve(); }
-    return M.downloadResource(url, name).then(function (ok) {
-      vstatus((ok ? '已下载：' : '已在新标签打开（可能被拦截）：') + name);
-    });
+  function refFor(url) {
+    if (/bilivideo\\.com|akamaized\\.net|szbdyd\\.com/i.test(url)) return 'https://www.bilibili.com/';
+    if (/douyinvod\\.com|douyin\\.com|snssdk\\.com|zjcdn/i.test(url)) return 'https://www.douyin.com/';
+    return '';
   }
 
-  function biliReferer() { return 'https://www.bilibili.com/'; }
+  function dlVideoItem(url, name) {
+    if (!alive()) { vstatus('原页面已关闭，无法下载', true); return Promise.resolve(); }
+    vstatus('⬇ 下载中：' + name + '（带 Referer 中继，大文件请等待，勿关原页面）');
+    var timer = setInterval(function () {
+      var p = M.getProgress && M.getProgress();
+      if (p && p.url === url && p.loaded) {
+        vstatus('⬇ ' + name + '：' + (p.total ? Math.round(p.loaded / p.total * 100) + '% · ' : '') + bytes(p.loaded));
+      }
+    }, 400);
+    return M.downloadResource(url, name, refFor(url)).then(function (ok) {
+      clearInterval(timer);
+      vstatus(ok ? '✅ 已保存：' + name : '❌ 保存失败：可复制链接用 IDM / ffmpeg 下载', !ok);
+    });
+  }
 
   function buildFfmpegCmd(title, v, a) {
     var R = ' -headers "Referer: https://www.bilibili.com/" ';
@@ -1504,7 +1658,7 @@
           var bestA = auds.length ? auds.reduce(function (a, b) { return (b.bandwidth || 0) > (a.bandwidth || 0) ? b : a; }) : null;
           html += '<div class="reco">'
             + '<div class="rt">⭐ 推荐组合：' + esc(bestV.label) + (bestA ? ' + ' + esc(bestA.label) : '（无独立音频流）') + '</div>'
-            + '<div class="rd">B站 DASH 的视频与音频是分离的：下载后用 ffmpeg 合并（或用 potplayer 等直接播放 m4s）。</div>'
+            + '<div class="rd">B站 DASH 音视频分离：下载已自动带 Referer（修复 403），两个文件下完用 ffmpeg 合并即可。</div>'
             + '<div class="actions" style="justify-content:flex-start">'
             + '<button class="btn primary" id="v-best-dl">⬇ 下载视频+音频</button>'
             + (bestA ? '<button class="btn" id="v-best-ff">📋 ffmpeg 合并命令</button>' : '')
