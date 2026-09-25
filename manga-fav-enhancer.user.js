@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         网页资源库 / 漫画收藏助手 (Web Resource Harvester)
 // @namespace    https://github.com/local/manga-fav-enhancer
-// @version      5.1.0
+// @version      6.0.0
 // @description  两种模式的独立弹窗工具：🌐 全局模式——精准识别网页中所有资源并按「角色」细分（主图/卡片配图/缩略图/头像/Logo/背景图/画廊/视频封面/装饰图/视频/音频/文档/压缩包/字体），带体积探测、预览与单个或批量下载；📚 漫画模式——为漫画站收藏提供标签分类、搜索、封面网格、批量打标（内置 18comic 系精确预设）。
 // @author       you
 // @match        *://*/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        unsafeWindow
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
@@ -14,6 +14,82 @@
 
 (function () {
   'use strict';
+
+  /* ==================================================================
+   * 早期网络 hook（document-start 立即安装）
+   * 拦截页面 fetch/XHR 响应中的媒体 URL（B站 playurl、抖音 play_addr、
+   * 任意 m3u8/mp4 直链），存入 unsafeWindow.__MFE_NET__ 供弹窗读取。
+   * ================================================================== */
+
+  const HOOK_MEDIA_RE = /https?:\/\/[^\s"'<>\\]+?\.(?:mp4|m3u8|flv|ts|m4s|mpd|webm|mov|mkv)(?:\?[^\s"'<>\\]*)?|https?:\/\/[^\s"'<>\\]*(?:douyinvod\.com|aweme\/v1\/play|bilivideo\.com|douyin\.com\/aweme)[^\s"'<>\\]*/gi;
+
+  function installNetHooks() {
+    const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    if (W.__MFE_HOOK_INSTALLED__) return;
+    try { W.__MFE_HOOK_INSTALLED__ = true; } catch (e) { return; }
+    const net = { items: [] };
+    W.__MFE_NET__ = net;
+
+    const push = (apiUrl, urls) => {
+      try {
+        for (const u of urls) {
+          if (!u || typeof u !== 'string' || u.length > 2000) continue;
+          if (net.items.some(x => x.url === u)) continue;
+          net.items.push({ url: u, api: String(apiUrl || '').slice(0, 200), t: Date.now() });
+          if (net.items.length > 600) net.items.shift();
+        }
+      } catch (e) { /* noop */ }
+    };
+
+    const scanText = (apiUrl, text) => {
+      try {
+        if (!text || typeof text !== 'string' || text.length > 15e6) return;
+        const urls = [];
+        let m;
+        HOOK_MEDIA_RE.lastIndex = 0;
+        while ((m = HOOK_MEDIA_RE.exec(text))) urls.push(m[0].replace(/\\u002f/gi, '/').replace(/\\\//g, '/'));
+        if (urls.length) push(apiUrl, urls);
+      } catch (e) { /* noop */ }
+    };
+
+    // XHR
+    try {
+      const XHR = W.XMLHttpRequest;
+      const origOpen = XHR.prototype.open;
+      const origSend = XHR.prototype.send;
+      XHR.prototype.open = function (method, u) {
+        this.__mfe_url = String(u || '');
+        return origOpen.apply(this, arguments);
+      };
+      XHR.prototype.send = function () {
+        this.addEventListener('load', () => {
+          try { scanText(this.__mfe_url, this.responseText); } catch (e) { /* noop */ }
+        });
+        return origSend.apply(this, arguments);
+      };
+    } catch (e) { /* noop */ }
+
+    // fetch
+    try {
+      const origFetch = W.fetch;
+      if (origFetch) {
+        W.fetch = function (input, init) {
+          const url = typeof input === 'string' ? input : (input && input.url) || '';
+          const p = origFetch.call(this, input, init);
+          return p.then((res) => {
+            try {
+              const ct = String((res.headers && res.headers.get('content-type')) || '');
+              if (/json|text|javascript/i.test(ct)) {
+                res.clone().text().then((t) => scanText(url, t)).catch(() => { /* noop */ });
+              }
+            } catch (e) { /* noop */ }
+            return res;
+          });
+        };
+      }
+    } catch (e) { /* noop */ }
+  }
+  installNetHooks();
 
   /* ==================================================================
    * 存储层（按站点主机名分库；弹窗同源共享同一 localStorage）
@@ -439,6 +515,155 @@
     return list;
   }
 
+  /* ==================================================================
+   * 平台视频解析（B站 / 抖音）——参考 SocialExt 的本地解析思路
+   * ================================================================== */
+
+  const BILI_QUALITY = { 16: '360P', 32: '480P', 64: '720P', 74: '720P60', 80: '1080P', 112: '1080P+', 116: '1080P60', 120: '4K', 125: 'HDR', 126: '杜比视界', 127: '8K' };
+  const BILI_AQUALITY = { 30216: '64kbps', 30232: '132kbps', 30280: '192kbps', 30250: '杜比全景声', 30251: 'Hi-Res' };
+  const BILI_CODEC = { 7: 'H.264', 12: 'H.265', 13: 'AV1' };
+
+  function parseBilibili(W) {
+    const out = { platform: '哔哩哔哩', title: '', bvid: '', items: [] };
+    try {
+      const st = W.__INITIAL_STATE__;
+      if (st && st.videoData) {
+        out.title = (st.videoData.title || '').trim();
+        out.bvid = st.videoData.bvid || '';
+      }
+    } catch (e) { /* noop */ }
+    if (!out.title) out.title = document.title.replace(/_哔哩哔哩.*$/, '').trim();
+
+    const parsePi = (pi) => {
+      const d = pi && pi.data;
+      if (!d) return;
+      // durl：完整文件（MP4/FLV）
+      if (Array.isArray(d.durl) && d.durl.length) {
+        d.durl.forEach((seg, i) => {
+          const u = seg.url || (seg.backupUrl && seg.backupUrl[0]);
+          if (u) out.items.push({
+            url: u, label: (d.durl.length > 1 ? '分段' + (i + 1) + ' · ' : '') + '完整文件',
+            kind: 'video', group: 'file', size: seg.size || 0, direct: true,
+          });
+        });
+      }
+      // dash：视频流 + 音频流分离
+      if (d.dash) {
+        const dur = d.timelength || 0; // ms
+        (d.dash.video || []).forEach(v => {
+          const u = v.baseUrl || (v.backupUrl && v.backupUrl[0]);
+          if (u) out.items.push({
+            url: u,
+            label: (BILI_QUALITY[v.id] || v.id + 'P') + ' 视频流' + (BILI_CODEC[v.codecid] ? ' ' + BILI_CODEC[v.codecid] : ''),
+            kind: 'video', group: 'video', bandwidth: v.bandwidth || 0,
+            size: dur && v.bandwidth ? Math.round(v.bandwidth * dur / 1000 / 8) : 0,
+            qualityId: v.id,
+          });
+        });
+        const audios = [...(d.dash.audio || []), ...((d.dash.dolby && d.dash.dolby.audio) || []), ...((d.dash.flac && d.dash.flac.audio) || [])];
+        audios.forEach(a => {
+          const u = a.baseUrl || (a.backupUrl && a.backupUrl[0]);
+          if (u) out.items.push({
+            url: u,
+            label: '音频流 ' + (BILI_AQUALITY[a.id] || (a.bandwidth ? Math.round(a.bandwidth / 1000) + 'kbps' : '')),
+            kind: 'audio', group: 'audio', bandwidth: a.bandwidth || 0,
+            size: dur && a.bandwidth ? Math.round(a.bandwidth * dur / 1000 / 8) : 0,
+          });
+        });
+      }
+    };
+
+    try { parsePi(W.__playinfo__); } catch (e) { /* noop */ }
+
+    // 正在播放的 MSE 流（标记，不给下载）
+    try {
+      document.querySelectorAll('video').forEach(v => {
+        if (v.src && v.src.startsWith('blob:')) {
+          out.items.push({ url: v.src, label: '正在播放（MSE 流，不可直接下载）', kind: 'video', group: 'stream', stream: true });
+        }
+      });
+    } catch (e) { /* noop */ }
+    return out;
+  }
+
+  function parseDouyin(W) {
+    const out = { platform: '抖音', title: '', awemeId: '', items: [] };
+    const seen = new Set();
+
+    const addPlay = (u, label, wm) => {
+      if (!u || seen.has(u)) return;
+      seen.add(u);
+      out.items.push({ url: u, label: label + (wm ? '（含水印）' : '（无水印）'), kind: 'video', group: wm ? 'video' : 'nowm', direct: true, wm: !!wm });
+    };
+
+    // 递归挖 SSR 数据里的视频地址
+    const scanNode = (node, depth) => {
+      if (!node || depth > 14) return;
+      if (typeof node === 'string') {
+        if (/^https?:\/\//.test(node) && /douyinvod\.com|snssdk\.com|aweme\/v1\/play|video\/tos/i.test(node)) {
+          const wm = /playwm/i.test(node);
+          addPlay(node, '视频', wm);
+          if (wm) addPlay(node.replace(/playwm/i, 'play'), '视频', false);
+        }
+        return;
+      }
+      if (Array.isArray(node)) { node.forEach(n => scanNode(n, depth + 1)); return; }
+      if (typeof node === 'object') {
+        for (const v of Object.values(node)) scanNode(v, depth + 1);
+      }
+    };
+
+    for (const key of ['_ROUTER_DATA', '__INIT_PROPS__', 'RENDER_DATA', 'SSR_RENDER_DATA', '__pace_f']) {
+      try {
+        const v = W[key];
+        if (!v) continue;
+        if (typeof v === 'string') {
+          scanNode(decodeURIComponent(v), 0);
+          try { scanNode(JSON.parse(decodeURIComponent(v)), 0); } catch (e) { /* noop */ }
+        } else {
+          scanNode(v, 0);
+        }
+      } catch (e) { /* noop */ }
+    }
+
+    // 标题
+    try {
+      const t = document.querySelector('h1, [data-e2e="video-desc"], .video-info-detail, [data-e2e="video-title"]');
+      if (t) out.title = t.textContent.trim().slice(0, 60);
+    } catch (e) { /* noop */ }
+    if (!out.title) out.title = document.title.replace(/ - 抖音.*$/, '').trim();
+
+    // 去重：含水印条目若存在对应无水印版本，标记提示
+    return out;
+  }
+
+  /** 平台扫描入口（弹窗调用）：识别当前站点并返回解析结果 + 网络拦截兜底 */
+  function platformScan() {
+    const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    const host = siteKey();
+    let platform = null;
+    if (/(^|\.)bilibili\.com$/i.test(host)) platform = parseBilibili(W);
+    else if (/(^|\.)douyin\.com$/i.test(host)) platform = parseDouyin(W);
+
+    const hooks = (W.__MFE_NET__ && Array.isArray(W.__MFE_NET__.items))
+      ? W.__MFE_NET__.items.slice(-200).map(x => ({ ...x }))
+      : [];
+
+    // hook 兜底里也做抖音去水印变体
+    const extra = [];
+    for (const h of hooks) {
+      if (/playwm/i.test(h.url)) {
+        extra.push({ url: h.url.replace(/playwm/i, 'play'), api: h.api, t: h.t });
+      }
+    }
+    return { platform, hooks: hooks.concat(extra), pageUrl: location.href };
+  }
+
+  /** 下载平台视频（GM_download；B站 dash 需要 Referer，GM_download 自带页面 origin） */
+  function downloadPlatformVideo(url, filename) {
+    return downloadResource(url, filename);
+  }
+
   /** HEAD 探测体积与真实 MIME */
   function probeSize(url) {
     return new Promise((resolve) => {
@@ -493,6 +718,7 @@
     loadEntries, saveEntries, store,
     scanPage, crawlNextPage, testPage,
     collectResources, downloadResource, probeSize,
+    platformScan,
   };
 
   /* ==================================================================
@@ -641,7 +867,34 @@
   .kchip:hover { border-color: #7c5cff; }
   .kchip.on { background: #7c5cff; border-color: #7c5cff; color: #fff; }
   .kchip .n { font-size: 11px; opacity: .7; }
-  .kchip.off { opacity: .45; }
+  .kindbar .kchip.off { opacity: .45; }
+  .vlist { flex: 1; overflow-y: auto; padding: 6px 16px 90px; }
+  .vtitle {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px 0 4px; font-size: 15px; font-weight: 600;
+  }
+  .vtitle .bid { font-size: 11px; color: #7a7b85; font-weight: 400; }
+  .vgroup { margin: 14px 0 6px; font-size: 11px; color: #7a7b85; letter-spacing: .08em; font-weight: 600; }
+  .vitem {
+    display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+    background: #1e1f26; border-radius: 9px; margin-bottom: 6px; border: 1px solid transparent;
+  }
+  .vitem:hover { border-color: #4a4b55; }
+  .vitem .lb { font-size: 13px; color: #e6e6e9; white-space: nowrap; }
+  .vitem .sub { font-size: 11px; color: #8d8e99; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .badge2 {
+    font-size: 10px; padding: 1px 8px; border-radius: 999px; white-space: nowrap;
+    background: #2c2d35; border: 1px solid #3a3b44; color: #a9aab4;
+  }
+  .badge2.hd { background: rgba(124,92,255,.18); color: #b9a8ff; border-color: #5b45c7; }
+  .badge2.wm { background: rgba(255,164,84,.15); color: #ffb26b; border-color: #8a5a2b; }
+  .badge2.nowm { background: rgba(80,200,140,.14); color: #7fe0ab; border-color: #2e7a54; }
+  .reco {
+    padding: 13px 15px; margin: 8px 0 4px; border-radius: 11px;
+    background: linear-gradient(135deg, #27223a, #1e1f26); border: 1px solid #5b45c7;
+  }
+  .reco .rt { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+  .reco .rd { font-size: 11px; color: #9a9ba6; line-height: 1.6; word-break: break-all; }
   .status { padding: 6px 16px; font-size: 12px; color: #8d8e99; min-height: 24px; flex-shrink: 0; }
   .status.err { color: #ff7a7a; }
   .grid {
@@ -712,6 +965,7 @@
 <body>
   <div class="top">
     <button class="tab on" id="tab-res">🌐 全局模式</button>
+    <button class="tab" id="tab-vid">🎬 视频下载</button>
     <button class="tab" id="tab-fav">📚 漫画模式</button>
 
     <span id="res-top" style="display:contents">
@@ -753,6 +1007,13 @@
       <div class="kindbar" id="kindbar"></div>
       <div class="status" id="rstatus"></div>
       <div class="grid" id="rgrid"></div>
+    </div>
+  </div>
+
+  <div class="body" id="vid-body" style="display:none">
+    <div class="main">
+      <div class="status" id="vstatus"></div>
+      <div class="vlist" id="vlist"></div>
     </div>
   </div>
 
@@ -815,14 +1076,18 @@
   function switchTab(t) {
     curTab = t;
     $('tab-res').className = 'tab' + (t === 'res' ? ' on' : '');
+    $('tab-vid').className = 'tab' + (t === 'vid' ? ' on' : '');
     $('tab-fav').className = 'tab' + (t === 'fav' ? ' on' : '');
     $('res-top').style.display = t === 'res' ? 'contents' : 'none';
     $('fav-top').style.display = t === 'fav' ? 'contents' : 'none';
     $('res-body').style.display = t === 'res' ? 'flex' : 'none';
+    $('vid-body').style.display = t === 'vid' ? 'flex' : 'none';
     $('fav-body').style.display = t === 'fav' ? 'flex' : 'none';
     renderSelbars();
+    if (t === 'vid' && !vidData) doVidScan();
   }
   $('tab-res').addEventListener('click', function () { switchTab('res'); });
+  $('tab-vid').addEventListener('click', function () { switchTab('vid'); });
   $('tab-fav').addEventListener('click', function () { switchTab('fav'); });
   function renderSelbars() {
     $('res-selbar').className = 'selbar' + (curTab === 'res' && resSel.length ? '' : ' hidden');
@@ -1154,6 +1419,203 @@
       renderResSelbar();
     }
   });
+
+  /* ================= 🎬 视频下载（B站/抖音 + 网络拦截兜底） ================= */
+
+  var vidData = null;   // { platform, hooks, pageUrl }
+
+  function vstatus(msg, isErr) {
+    var el = $('vstatus');
+    if (el) { el.textContent = msg || ''; el.className = 'status' + (isErr ? ' err' : ''); }
+  }
+
+  function doVidScan() {
+    if (!alive()) { vstatus('原页面已关闭，请回到原页面重新打开', true); return; }
+    try {
+      vidData = M.platformScan();
+      renderVid();
+      var pf = vidData.platform;
+      if (pf) vstatus('已解析' + pf.platform + (pf.title ? '：' + pf.title : '') + '，共 ' + pf.items.length + ' 条' + (vidData.hooks.length ? '（另拦截到 ' + vidData.hooks.length + ' 个网络媒体地址）' : ''));
+      else vstatus('当前站点没有专属解析器；已拦截到 ' + vidData.hooks.length + ' 个网络媒体地址（通用兜底）');
+    } catch (e) { vstatus('解析失败：' + e.message, true); }
+  }
+
+  function safeName(s) {
+    return String(s || 'video').replace(/[\\\\/:*?"<>|\\r\\n]/g, '_').slice(0, 80);
+  }
+
+  function vidExt(url, kind) {
+    if (/\\.flv([?#]|$)/i.test(url)) return '.flv';
+    if (/\\.mp4([?#]|$)/i.test(url)) return '.mp4';
+    if (/\\.m4s([?#]|$)/i.test(url)) return '.m4s';
+    if (/\\.m3u8([?#]|$)/i.test(url)) return '.m3u8';
+    return kind === 'audio' ? '.m4a' : '.mp4';
+  }
+
+  function dlVideoItem(url, name) {
+    if (!alive()) { vstatus('原页面已关闭，无法下载', true); return Promise.resolve(); }
+    return M.downloadResource(url, name).then(function (ok) {
+      vstatus((ok ? '已下载：' : '已在新标签打开（可能被拦截）：') + name);
+    });
+  }
+
+  function biliReferer() { return 'https://www.bilibili.com/'; }
+
+  function buildFfmpegCmd(title, v, a) {
+    var R = ' -headers "Referer: https://www.bilibili.com/" ';
+    var cmd = 'ffmpeg' + R + '-i "' + v.url + '"' + (a ? (R + '-i "' + a.url + '"') : '') + ' -c copy "' + safeName(title) + '.mp4"';
+    return cmd;
+  }
+
+  function copyTextV(text, label) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { vstatus(label); }, function () { fbCopyV(text, label); });
+    } else fbCopyV(text, label);
+  }
+  function fbCopyV(text, label) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); vstatus(label); } catch (e) { vstatus('复制失败', true); }
+    ta.remove();
+  }
+
+  function renderVid() {
+    var g = $('vlist');
+    var html = '';
+    var pf = vidData && vidData.platform;
+
+    if (!pf && (!vidData || !vidData.hooks.length)) {
+      g.innerHTML = '<div class="empty">此页面暂无可抓取的视频<br>支持专属解析的站点：哔哩哔哩 / 抖音<br>其他站点会自动拦截网络层里的视频地址（m3u8/mp4 等）<br>打开视频页面播放后，点「重新解析」试试</div>'
+        + '<div class="vitem"><span class="sub"></span><button class="btn" id="v-rescan">🔄 重新解析</button></div>';
+      return;
+    }
+
+    if (pf) {
+      html += '<div class="vtitle">🎬 ' + esc(pf.platform) + '<span class="bid">' + esc(pf.title || '') + (pf.bvid ? ' · ' + esc(pf.bvid) : '') + '</span></div>';
+
+      // B站：推荐组合（最高清晰度视频流 + 最高音质音频流）
+      if (pf.platform === '哔哩哔哩') {
+        var vids = pf.items.filter(function (x) { return x.group === 'video'; });
+        var auds = pf.items.filter(function (x) { return x.group === 'audio'; });
+        if (vids.length) {
+          var bestV = vids.reduce(function (a, b) { return (b.qualityId || 0) > (a.qualityId || 0) ? b : a; });
+          var bestA = auds.length ? auds.reduce(function (a, b) { return (b.bandwidth || 0) > (a.bandwidth || 0) ? b : a; }) : null;
+          html += '<div class="reco">'
+            + '<div class="rt">⭐ 推荐组合：' + esc(bestV.label) + (bestA ? ' + ' + esc(bestA.label) : '（无独立音频流）') + '</div>'
+            + '<div class="rd">B站 DASH 的视频与音频是分离的：下载后用 ffmpeg 合并（或用 potplayer 等直接播放 m4s）。</div>'
+            + '<div class="actions" style="justify-content:flex-start">'
+            + '<button class="btn primary" id="v-best-dl">⬇ 下载视频+音频</button>'
+            + (bestA ? '<button class="btn" id="v-best-ff">📋 ffmpeg 合并命令</button>' : '')
+            + '</div></div>';
+        }
+      }
+
+      // 分组渲染平台条目
+      var groups = [['nowm', '无水印视频'], ['video', pf.platform === '哔哩哔哩' ? 'DASH 视频流（各清晰度）' : '视频'], ['audio', 'DASH 音频流'], ['file', '完整文件（可直接播放）'], ['stream', '正在播放的流']];
+      var groupShown = {};
+      for (var gi = 0; gi < groups.length; gi++) {
+        var items = pf.items.filter(function (x) { return x.group === groups[gi][0]; });
+        if (!items.length) continue;
+        html += '<div class="vgroup">' + esc(groups[gi][1]) + '</div>';
+        for (var i = 0; i < items.length; i++) {
+          var it = items[i];
+          var idx = 'v-' + groups[gi][0] + '-' + i;
+          groupShown[idx] = it;
+          var sizeStr = it.size ? ' · ' + bytes(it.size) : (it.bandwidth ? ' · ' + Math.round(it.bandwidth / 1000) + 'kbps' : '');
+          var badge = '';
+          if (it.group === 'nowm') badge = '<span class="badge2 nowm">无水印</span>';
+          else if (it.wm) badge = '<span class="badge2 wm">含水印</span>';
+          else if (it.group === 'video' && pf.platform === '哔哩哔哩') badge = '<span class="badge2 hd">' + esc((it.label.split(' ')[0]) || '') + '</span>';
+          else if (it.stream) badge = '<span class="badge2 wm">流</span>';
+          html += '<div class="vitem" data-url="' + esc(it.url) + '">'
+            + '<span class="lb">' + esc(it.label) + '</span>' + badge
+            + '<span class="sub">' + esc(it.url.slice(0, 90)) + sizeStr + '</span>'
+            + (it.stream ? '' : '<button class="btn primary vdl">⬇</button>')
+            + '<button class="btn vcp">📋</button>'
+            + '<button class="btn vop">↗</button>'
+            + '</div>';
+        }
+      }
+    }
+
+    // 网络拦截兜底
+    if (vidData && vidData.hooks.length) {
+      html += '<div class="vgroup">🌐 网络拦截（页面请求中发现的媒体地址）</div>';
+      var seen = {};
+      if (pf) pf.items.forEach(function (x) { seen[x.url] = 1; });
+      var shown = 0;
+      for (var h = 0; h < vidData.hooks.length; h++) {
+        var hk = vidData.hooks[h];
+        if (seen[hk.url]) continue;
+        seen[hk.url] = 1;
+        shown++;
+        var isM3u8 = /m3u8/i.test(hk.url);
+        html += '<div class="vitem" data-url="' + esc(hk.url) + '">'
+          + '<span class="lb">' + (isM3u8 ? 'HLS 列表' : '媒体地址') + '</span>'
+          + '<span class="sub">' + esc(hk.url.slice(0, 110)) + (hk.api ? ' ← ' + esc(String(hk.api).slice(0, 60)) : '') + '</span>'
+          + '<button class="btn primary vdl">⬇</button>'
+          + '<button class="btn vcp">📋</button>'
+          + '<button class="btn vop">↗</button>'
+          + '</div>';
+      }
+      if (!shown) html += '<div class="vitem"><span class="sub">（均与上方条目重复）</span></div>';
+    }
+
+    html += '<div class="vitem"><span class="sub"></span><button class="btn" id="v-rescan">🔄 重新解析</button></div>';
+    g.innerHTML = html;
+  }
+
+  /** vlist 事件委托（只挂一次，避免重复绑定） */
+  function bindVidEvents() {
+    var g = $('vlist');
+    g.addEventListener('click', function (ev) {
+      var id = ev.target.id;
+      var pf = vidData && vidData.platform;
+
+      if (id === 'v-rescan') { doVidScan(); return; }
+      if (id === 'v-best-dl' && pf) {
+        var vids = pf.items.filter(function (x) { return x.group === 'video'; });
+        var auds = pf.items.filter(function (x) { return x.group === 'audio'; });
+        var bestV = vids.reduce(function (a, b) { return (b.qualityId || 0) > (a.qualityId || 0) ? b : a; });
+        var bestA = auds.length ? auds.reduce(function (a, b) { return (b.bandwidth || 0) > (a.bandwidth || 0) ? b : a; }) : null;
+        var base = safeName(pf.title || 'bilibili') + '_' + (bestV.label.split(' ')[0] || 'video');
+        dlVideoItem(bestV.url, base + '_video' + vidExt(bestV.url)).then(function () {
+          if (bestA) setTimeout(function () {
+            dlVideoItem(bestA.url, base + '_audio' + vidExt(bestA.url));
+          }, 500);
+        });
+        return;
+      }
+      if (id === 'v-best-ff' && pf) {
+        var vids2 = pf.items.filter(function (x) { return x.group === 'video'; });
+        var auds2 = pf.items.filter(function (x) { return x.group === 'audio'; });
+        var bV = vids2.reduce(function (a, b) { return (b.qualityId || 0) > (a.qualityId || 0) ? b : a; });
+        var bA = auds2.reduce(function (a, b) { return (b.bandwidth || 0) > (a.bandwidth || 0) ? b : a; });
+        copyTextV(buildFfmpegCmd(pf.title, bV, bA), '已复制 ffmpeg 合并命令');
+        return;
+      }
+
+      var item = ev.target.closest && ev.target.closest('.vitem');
+      if (!item || !item.getAttribute('data-url')) return;
+      var url = item.getAttribute('data-url');
+      var cls = ev.target.classList;
+      if (cls && cls.contains('vdl')) {
+        var name = safeName((pf && pf.title) || 'video');
+        if (pf && pf.platform === '哔哩哔哩') {
+          var lb = (item.querySelector('.lb') || {}).textContent || 'video';
+          name += '_' + lb.split(' ')[0] + vidExt(url);
+        } else name += vidExt(url);
+        dlVideoItem(url, name);
+      } else if (cls && cls.contains('vcp')) {
+        copyTextV(url, '已复制 URL');
+      } else if (cls && cls.contains('vop')) {
+        window.open(url, '_blank');
+      }
+    });
+  }
+  bindVidEvents();
 
   /* ================= 漫画模式：收藏库 ================= */
 
