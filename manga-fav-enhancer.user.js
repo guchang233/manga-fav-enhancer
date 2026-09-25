@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页资源库 / 漫画收藏助手 (Web Resource Harvester)
 // @namespace    https://github.com/local/manga-fav-enhancer
-// @version      6.2.0
+// @version      6.3.0
 // @description  两种模式的独立弹窗工具：🌐 全局模式——精准识别网页中所有资源并按「角色」细分（主图/卡片配图/缩略图/头像/Logo/背景图/画廊/视频封面/装饰图/视频/音频/文档/压缩包/字体），带体积探测、预览与单个或批量下载；📚 漫画模式——为漫画站收藏提供标签分类、搜索、封面网格、批量打标（内置 18comic 系精确预设）；🎬 视频下载——B站 playurl API 解析（fnval=4048 各清晰度/音视频分离）+ Referer 中继下载（修复 CDN 403）、抖音官方接口无水印解析。
 // @author       you
 // @match        *://*/*
@@ -820,6 +820,27 @@
       setTimeout(() => { try { URL.revokeObjectURL(bu); } catch (e) { /* noop */ } }, 120000);
       return true;
     };
+    // 页面上下文 XHR（第一优先）：与 B站/抖音播放器完全同一条通道——
+    // 浏览器自动附带真实 Referer/UA/Origin，CDN 的 CORS 白名单放行本站来源
+    // （实测返回 Access-Control-Allow-Origin: https://www.bilibili.com）。
+    // 不依赖油猴注入请求头：GM_xmlhttpRequest 的自定义 Referer/UA 在新版
+    // Chrome/MV3 下经常被丢弃，这正是此前 403/0 秒问题的元凶。
+    const viaPageXHR = () => new Promise((resolve) => {
+      try {
+        const ref = referer || cdnReferer(url);
+        if (!ref || typeof XMLHttpRequest !== 'function' || !location.origin || ref.indexOf(location.origin) !== 0) return resolve(false);
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url, true);
+        xhr.responseType = 'blob';
+        xhr.onprogress = (e) => prog(e.loaded, e.total || 0);
+        xhr.onload = () => {
+          if (xhr.status >= 400 || !xhr.response) return resolve(false);
+          try { resolve(saveBlob(xhr.response)); } catch (e) { resolve(false); }
+        };
+        xhr.onerror = () => resolve(false);
+        xhr.send();
+      } catch (e) { resolve(false); }
+    });
     const viaGMXL = () => new Promise((resolve) => {
       if (typeof GM_xmlhttpRequest !== 'function') return resolve(false);
       try {
@@ -857,9 +878,9 @@
     return new Promise(async (resolve) => {
       const needRef = !!(referer || cdnReferer(url));
       let ok = false;
-      if (needRef) ok = await viaGMXL();
-      if (!ok) ok = await viaGMDownload();
+      if (needRef) ok = await viaPageXHR();
       if (!ok) ok = await viaGMXL();
+      if (!ok) ok = await viaGMDownload();
       if (!ok) ok = viaAnchor();
       prog(0, 0);
       resolve(!!ok);
