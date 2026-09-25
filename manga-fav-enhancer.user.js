@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页资源库 / 漫画收藏助手 (Web Resource Harvester)
 // @namespace    https://github.com/local/manga-fav-enhancer
-// @version      5.0.0
+// @version      5.1.0
 // @description  两种模式的独立弹窗工具：🌐 全局模式——精准识别网页中所有资源并按「角色」细分（主图/卡片配图/缩略图/头像/Logo/背景图/画廊/视频封面/装饰图/视频/音频/文档/压缩包/字体），带体积探测、预览与单个或批量下载；📚 漫画模式——为漫画站收藏提供标签分类、搜索、封面网格、批量打标（内置 18comic 系精确预设）。
 // @author       you
 // @match        *://*/*
@@ -229,11 +229,12 @@
 
   const EXT_KIND = {
     image: 'jpg jpeg png gif webp avif svg bmp ico tiff heic',
-    video: 'mp4 webm mkv m4v mov avi flv ogv ts m3u8',
-    audio: 'mp3 m4a wav ogg oga flac aac opus wma mid',
+    video: 'mp4 webm mkv m4v mov avi flv ogv ts m3u8 m4s mpd',
+    audio: 'mp3 m4a wav ogg oga flac aac opus wma mid mka',
     doc: 'pdf doc docx xls xlsx ppt pptx txt epub mobi csv md',
     archive: 'zip rar 7z tar gz bz2 xz iso apk exe dmg',
     font: 'woff woff2 ttf otf eot',
+    subtitle: 'vtt srt ass ssa xml',
   };
 
   const ROLE_RE = {
@@ -279,10 +280,13 @@
     const add = (raw, kind, role, meta) => {
       if (!raw) return;
       const s = String(raw).trim();
-      if (!s || /^(blob:|javascript:|about:|mailto:|tel:)/i.test(s)) return;
+      if (!s || /^(javascript:|about:|mailto:|tel:)/i.test(s)) return;
+      const isBlob = /^blob:/i.test(s);
       let url;
       try { url = new URL(s, location.href).href; } catch { return; }
-      if (!/^https?:/.test(url)) return;
+      if (!isBlob && !/^https?:/.test(url)) return;
+      // blob: 只保留视频/音频（流媒体，列出来但标注不可直接下载）
+      if (isBlob && kind !== 'video' && kind !== 'audio') return;
 
       const prev = out.get(url);
       if (prev) {
@@ -298,6 +302,7 @@
       out.set(url, Object.assign({
         url, kind: guessKind(url, kind), role: role || 'other',
         w, h, area: w * h, host, src: (meta && meta.src) || 'attr',
+        stream: isBlob,
       }, meta || {}));
     };
 
@@ -356,6 +361,12 @@
       el.querySelectorAll('source').forEach(s => {
         add(s.getAttribute('src'), 'video', role, { src: 'video-source' });
       });
+      // 字幕轨
+      el.querySelectorAll('track').forEach(t => add(t.getAttribute('src'), 'subtitle', 'subtitle', { src: 'track' }));
+      // 常见懒加载 / data 属性里的真实地址
+      ['data-src', 'data-video', 'data-video-src', 'data-mp4', 'data-url', 'data-original'].forEach(attr => {
+        add(el.getAttribute(attr), 'video', role, { src: attr });
+      });
       if (el.poster) add(el.poster, 'image', 'poster', { src: 'poster' });
     });
 
@@ -363,7 +374,21 @@
     doc.querySelectorAll('audio').forEach(el => {
       add(el.currentSrc || el.src, 'audio', 'audio', { src: 'audio' });
       el.querySelectorAll('source').forEach(s => add(s.getAttribute('src'), 'audio', 'audio', { src: 'audio-source' }));
+      ['data-src', 'data-audio', 'data-audio-src', 'data-mp3', 'data-url'].forEach(attr => {
+        add(el.getAttribute(attr), 'audio', 'audio', { src: attr });
+      });
     });
+
+    /* --- 独立的 <source> / <track>（不在 video/audio 内时） --- */
+    doc.querySelectorAll('source').forEach(s => {
+      const t = (s.getAttribute('type') || '').toLowerCase();
+      if (t.startsWith('video') || /\.(mp4|webm|m3u8|ts|mkv|mov|m4s)([?#]|$)/i.test(s.getAttribute('src') || '')) {
+        add(s.getAttribute('src'), 'video', 'video', { src: 'source' });
+      } else if (t.startsWith('audio') || /\.(mp3|m4a|wav|ogg|flac|aac|mka)([?#]|$)/i.test(s.getAttribute('src') || '')) {
+        add(s.getAttribute('src'), 'audio', 'audio', { src: 'source' });
+      }
+    });
+    doc.querySelectorAll('track').forEach(t => add(t.getAttribute('src'), 'subtitle', 'subtitle', { src: 'track' }));
 
     /* --- <embed> / <object> --- */
     doc.querySelectorAll('embed,object').forEach(el => {
@@ -376,7 +401,7 @@
     });
 
     /* --- 直接指向资源文件的链接 --- */
-    const FILE_LINK_RE = /\.(zip|rar|7z|tar|gz|pdf|docx?|xlsx?|pptx?|epub|mp4|mkv|webm|mp3|flac|wav|ogg|woff2?|ttf|otf)([?#]|$)/i;
+    const FILE_LINK_RE = /\.(zip|rar|7z|tar|gz|pdf|docx?|xlsx?|pptx?|epub|mp4|mkv|webm|mov|m3u8|ts|mp3|m4a|flac|wav|ogg|vtt|srt|ass|woff2?|ttf|otf)([?#]|$)/i;
     doc.querySelectorAll('a[href]').forEach(a => {
       if (FILE_LINK_RE.test(a.href)) add(a.href, null, 'file-link', { src: 'link' });
     });
@@ -607,6 +632,16 @@
   .cat.on { background: #7c5cff; color: #fff; }
   .cat .n { font-size: 11px; opacity: .65; }
   .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .kindbar { display: flex; gap: 6px; padding: 8px 16px 4px; flex-wrap: wrap; flex-shrink: 0; }
+  .kchip {
+    font-size: 12px; padding: 4px 12px; border-radius: 999px; cursor: pointer;
+    border: 1px solid #3a3b44; background: #1e1f26; color: #c9cad2; user-select: none;
+    display: flex; align-items: center; gap: 5px;
+  }
+  .kchip:hover { border-color: #7c5cff; }
+  .kchip.on { background: #7c5cff; border-color: #7c5cff; color: #fff; }
+  .kchip .n { font-size: 11px; opacity: .7; }
+  .kchip.off { opacity: .45; }
   .status { padding: 6px 16px; font-size: 12px; color: #8d8e99; min-height: 24px; flex-shrink: 0; }
   .status.err { color: #ff7a7a; }
   .grid {
@@ -689,6 +724,7 @@
       </select>
       <label><input type="checkbox" id="r-hidesmall" checked> 隐藏小图标</label>
       <label><input type="checkbox" id="r-onlysite"> 仅本站</label>
+      <label><input type="checkbox" id="r-dlonly"> 仅可下载</label>
       <button class="btn primary" id="r-scan">扫描本页资源</button>
       <button class="btn" id="r-selall">全选</button>
       <button class="btn" id="r-probe">获取体积</button>
@@ -714,6 +750,7 @@
   <div class="body" id="res-body">
     <aside class="side" id="rside"></aside>
     <div class="main">
+      <div class="kindbar" id="kindbar"></div>
       <div class="status" id="rstatus"></div>
       <div class="grid" id="rgrid"></div>
     </div>
@@ -797,20 +834,22 @@
   var ROLE_LABEL = {
     hero: '主图', gallery: '画廊图', card: '卡片配图', content: '正文配图', thumbnail: '缩略图',
     avatar: '头像', logo: 'Logo/图标', background: '背景图', poster: '视频封面', sprite: '装饰小图',
-    video: '视频', audio: '音频', file: '文件', 'file-link': '文件链接', iframe: '内嵌页面', other: '其他', 'other-file': '其他文件',
+    video: '视频', audio: '音频', subtitle: '字幕', file: '文件', 'file-link': '文件链接',
+    iframe: '内嵌页面', other: '其他', 'other-file': '其他文件',
   };
-  var KIND_LABEL = { image: '图片', video: '视频', audio: '音频', doc: '文档', archive: '压缩包', font: '字体', other: '其他' };
-  var KIND_ICON = { image: '🖼', video: '🎬', audio: '🎵', doc: '📄', archive: '🗜', font: '🔤', other: '🔗' };
+  var KIND_LABEL = { image: '图片', video: '视频', audio: '音频', doc: '文档', archive: '压缩包', font: '字体', subtitle: '字幕', other: '其他' };
+  var KIND_ICON = { image: '🖼', video: '🎬', audio: '🎵', doc: '📄', archive: '🗜', font: '🔤', subtitle: '💬', other: '🔗' };
+  var KIND_ORDER = ['image', 'video', 'audio', 'doc', 'archive', 'font', 'subtitle', 'other'];
   var SIDE_GROUPS = [
     ['-', 'all'],
     ['图片（按角色）', 'hero', 'gallery', 'card', 'content', 'thumbnail', 'avatar', 'logo', 'background', 'poster', 'sprite'],
-    ['媒体', 'video', 'audio'],
+    ['媒体', 'video', 'audio', 'subtitle'],
     ['文件', 'doc', 'archive', 'font', 'file-link', 'iframe', 'other'],
   ];
 
   var resList = [];
   var resSel = [];
-  var resView = { q: '', role: 'all', onlySite: false, hideSmall: true, sort: 'area' };
+  var resView = { q: '', kind: 'all', role: 'all', onlySite: false, hideSmall: true, dlOnly: false, sort: 'area' };
 
   function rstatus(msg, isErr) {
     var el = $('rstatus');
@@ -827,11 +866,32 @@
     } catch (e) { rstatus('扫描失败：' + e.message, true); }
   }
 
-  function resFiltered() {
+  function resBase() {
+    // 种类 → 站点 → 可下载 → 小图标（角色筛选在最后，便于分类栏按当前范围统计）
     var list = resList;
-    if (resView.role !== 'all') list = list.filter(function (r) { return r.role === resView.role; });
+    if (resView.kind !== 'all') list = list.filter(function (r) { return r.kind === resView.kind; });
     if (resView.onlySite) list = list.filter(function (r) { return r.host === HOST; });
+    if (resView.dlOnly) list = list.filter(function (r) { return !r.stream; });
     if (resView.hideSmall) list = list.filter(function (r) { return r.role !== 'sprite' && !(r.kind === 'image' && r.w && r.w < 96); });
+    return list;
+  }
+
+  function renderKindBar() {
+    var count = {};
+    for (var i = 0; i < resList.length; i++) count[resList[i].kind] = (count[resList[i].kind] || 0) + 1;
+    var html = '<div class="kchip' + (resView.kind === 'all' ? ' on' : '') + '" data-kind="all">全部<span class="n">' + resList.length + '</span></div>';
+    for (var j = 0; j < KIND_ORDER.length; j++) {
+      var k = KIND_ORDER[j];
+      var n = count[k] || 0;
+      html += '<div class="kchip' + (resView.kind === k ? ' on' : '') + (n ? '' : ' off') + '" data-kind="' + k + '">'
+        + (KIND_ICON[k] || '') + KIND_LABEL[k] + '<span class="n">' + n + '</span></div>';
+    }
+    $('kindbar').innerHTML = html;
+  }
+
+  function resFiltered() {
+    var list = resBase();
+    if (resView.role !== 'all') list = list.filter(function (r) { return r.role === resView.role; });
     if (resView.q) {
       var q = resView.q.toLowerCase();
       list = list.filter(function (r) { return r.url.toLowerCase().indexOf(q) >= 0; });
@@ -846,8 +906,9 @@
   }
 
   function renderResSide() {
+    var base = resBase();
     var count = {};
-    for (var i = 0; i < resList.length; i++) count[resList[i].role] = (count[resList[i].role] || 0) + 1;
+    for (var i = 0; i < base.length; i++) count[base[i].role] = (count[base[i].role] || 0) + 1;
     var html = '';
     for (var g = 0; g < SIDE_GROUPS.length; g++) {
       var group = SIDE_GROUPS[g];
@@ -862,8 +923,8 @@
       for (var j = 1; j < group.length; j++) {
         var role = group[j];
         if (role !== 'all' && !count[role]) continue;
-        var n = role === 'all' ? resList.length : (count[role] || 0);
-        var label = role === 'all' ? '全部资源' : (ROLE_LABEL[role] || role);
+        var n = role === 'all' ? base.length : (count[role] || 0);
+        var label = role === 'all' ? '全部' : (ROLE_LABEL[role] || role);
         html += '<div class="cat' + (resView.role === role ? ' on' : '') + '" data-role="' + role + '"><span class="l">' + label + '</span><span class="n">' + n + '</span></div>';
       }
     }
@@ -871,6 +932,7 @@
   }
 
   function renderRes() {
+    renderKindBar();
     renderResSide();
     var list = resFiltered();
     var g = $('rgrid');
@@ -885,9 +947,9 @@
         var sel = resSel.indexOf(r.url) >= 0;
         var name = fileBase(r.url) || r.url;
         out += '<div class="card' + (sel ? ' sel' : '') + '" data-url="' + esc(r.url) + '" title="' + esc(r.url) + '">';
-        out += '<span class="badge">' + esc(ROLE_LABEL[r.role] || r.role) + '</span>';
+        out += '<span class="badge' + (r.stream ? ' grey' : '') + '">' + (r.stream ? '流媒体' : esc(ROLE_LABEL[r.role] || r.role)) + '</span>';
         out += '<span class="act">'
-          + '<button class="dl" title="下载">⬇</button>'
+          + (r.stream ? '' : '<button class="dl" title="下载">⬇</button>')
           + '<button class="op" title="新标签打开">↗</button></span>';
         out += '<input type="checkbox" class="pick"' + (sel ? ' checked' : '') + '>';
         if (r.kind === 'image') {
@@ -1006,7 +1068,8 @@
     back.className = 'dlgback';
     var inner;
     if (r.kind === 'image') inner = '<img class="pv-img" src="' + esc(r.url) + '">';
-    else if (r.kind === 'video') inner = '<video class="pv-vid" src="' + esc(r.url) + '" controls autoplay></video>';
+    else if (r.kind === 'video') inner = '<video class="pv-vid" src="' + esc(r.url) + '" controls autoplay></video>'
+      + (r.stream ? '<div class="hint">⚠️ 这是运行时流媒体地址（blob/MSE），无法直接下载；需用录屏或专门的流媒体抓取工具。</div>' : '');
     else if (r.kind === 'audio') inner = '<audio src="' + esc(r.url) + '" controls autoplay style="width:100%"></audio>';
     else inner = '<div style="text-align:center;padding:24px 0;font-size:40px">' + (KIND_ICON[r.kind] || '🔗') + '<div class="hint">该类型不支持内嵌预览，可直接下载</div></div>';
 
@@ -1043,6 +1106,14 @@
   $('rsort').addEventListener('change', function () { resView.sort = this.value; renderRes(); });
   $('r-onlysite').addEventListener('change', function () { resView.onlySite = this.checked; renderRes(); });
   $('r-hidesmall').addEventListener('change', function () { resView.hideSmall = this.checked; renderRes(); });
+  $('r-dlonly').addEventListener('change', function () { resView.dlOnly = this.checked; renderRes(); });
+  $('kindbar').addEventListener('click', function (ev) {
+    var chip = ev.target.closest && ev.target.closest('.kchip');
+    if (!chip) return;
+    resView.kind = chip.getAttribute('data-kind');
+    resView.role = 'all';
+    renderRes();
+  });
   $('r-scan').addEventListener('click', doResScan);
   $('r-selall').addEventListener('click', function () {
     resSel = resFiltered().map(function (r) { return r.url; });
